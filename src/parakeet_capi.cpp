@@ -35,12 +35,22 @@
 // v6: transcribe_pcm_logits, exposing the CTC head's log-prob matrix (row-major
 //     [T, vocab+1], already log-softmaxed) instead of decoded text, freed with
 //     the new free_logits. Original entry points unchanged.
-#define PARAKEET_CAPI_ABI_VERSION 6
+// v7: context biasing / word boosting (set_boost_phrases / clear_boost_phrases),
+//     a port of NeMo's GPU-PB phrase-boosting tree applied as shallow fusion in
+//     the TDT beam, TDT greedy, and CTC greedy decoders. Purely additive: a
+//     context with no phrases attached decodes exactly as before.
+#define PARAKEET_CAPI_ABI_VERSION 7
 
 // The opaque context: a loaded model plus a buffer for the last error message.
 struct parakeet_ctx {
     std::unique_ptr<pk::Model> model;
     std::string last_error;
+    // Context biasing, compiled once per phrase list and reused by every
+    // transcribe call on this context. `boost.tree` points at `boost_tree`, so
+    // the config stays valid for the context's lifetime; both are reset
+    // together whenever the phrase list changes.
+    pk::BoostingTree boost_tree;
+    pk::BoostingConfig boost;
 };
 
 // The opaque streaming session: a pk::StreamingSession over the ctx's model plus
@@ -387,6 +397,56 @@ extern "C" char* parakeet_capi_transcribe_pcm_batch_json(parakeet_ctx* ctx,
                                                         nullptr);
 }
 
+extern "C" int parakeet_capi_set_boost_phrases(
+        parakeet_ctx* ctx, const char* const* phrases, int n_phrases,
+        float alpha, float context_score, float depth_scaling) {
+    if (!ctx) return -1;
+    if (!ctx->model) {
+        ctx->last_error = "context has no loaded model";
+        return -1;
+    }
+    if (n_phrases < 0) {
+        ctx->last_error = "n_phrases is negative";
+        return -1;
+    }
+    if (n_phrases > 0 && !phrases) {
+        ctx->last_error = "phrases is NULL";
+        return -1;
+    }
+    try {
+        pk::BoostingSpec spec;
+        spec.alpha = alpha;
+        if (context_score != 0.0f) spec.params.context_score = context_score;
+        if (depth_scaling != 0.0f) spec.params.depth_scaling = depth_scaling;
+        spec.phrases.reserve((size_t)n_phrases);
+        for (int i = 0; i < n_phrases; ++i) {
+            if (!phrases[i]) {
+                ctx->last_error = "phrases contains a NULL entry";
+                return -1;
+            }
+            spec.phrases.emplace_back(phrases[i]);
+        }
+
+        ctx->boost_tree = ctx->model->build_boosting_tree(spec);
+        ctx->boost.tree = &ctx->boost_tree;
+        ctx->boost.alpha = alpha;
+        ctx->last_error.clear();
+        return (int)ctx->boost_tree.phrase_count();
+    } catch (const std::exception& e) {
+        ctx->last_error = e.what();
+        return -1;
+    } catch (...) {
+        ctx->last_error = "unknown error";
+        return -1;
+    }
+}
+
+extern "C" void parakeet_capi_clear_boost_phrases(parakeet_ctx* ctx) {
+    if (!ctx) return;
+    ctx->boost_tree = pk::BoostingTree();
+    ctx->boost = pk::BoostingConfig();
+}
+
 extern "C" char* parakeet_capi_transcribe_path_nbest_json(
         parakeet_ctx* ctx, const char* wav_path,
         int beam_size, int nbest, int score_norm, const char* target_lang) {
@@ -404,7 +464,7 @@ extern "C" char* parakeet_capi_transcribe_path_nbest_json(
         const std::string lang = target_lang ? target_lang : "";
         std::vector<pk::NBestTranscription> hypotheses =
             ctx->model->transcribe_path_nbest(
-                wav_path, beam_size, nbest, normalize, lang);
+                wav_path, beam_size, nbest, normalize, lang, ctx->boost);
         const pk::ParakeetConfig& cfg = ctx->model->config();
         const float frame_sec =
             (float)cfg.hop_length * (float)cfg.subsampling_factor /
@@ -445,7 +505,8 @@ extern "C" char* parakeet_capi_transcribe_pcm_nbest_json(
         const std::vector<float> pcm(samples, samples + n_samples);
         std::vector<pk::NBestTranscription> hypotheses =
             ctx->model->transcribe_pcm_nbest(
-                pcm, sample_rate, beam_size, nbest, normalize, lang);
+                pcm, sample_rate, beam_size, nbest, normalize, lang,
+                ctx->boost);
         const pk::ParakeetConfig& cfg = ctx->model->config();
         const float frame_sec =
             (float)cfg.hop_length * (float)cfg.subsampling_factor /

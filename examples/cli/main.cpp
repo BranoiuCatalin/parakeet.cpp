@@ -205,6 +205,9 @@ static int cmd_transcribe(int argc, char** argv) {
     int beam_size = 0;
     int nbest = 0;
     int threads = 0;  // 0 == unset -> use the persistent-backend default
+    std::vector<std::string> boost_phrases;
+    std::string boost_file;
+    float boost_alpha = 2.0f;   // sensible default once phrases are supplied
     for (int i = 0; i < argc; ++i) {
         if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             model = argv[++i];
@@ -228,6 +231,32 @@ static int cmd_transcribe(int argc, char** argv) {
             nbest = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-score-norm") == 0) {
             score_norm = false;
+        } else if (std::strcmp(argv[i], "--boost") == 0 && i + 1 < argc) {
+            boost_phrases.push_back(argv[++i]);
+        } else if (std::strcmp(argv[i], "--boost-file") == 0 && i + 1 < argc) {
+            boost_file = argv[++i];
+        } else if (std::strcmp(argv[i], "--boost-alpha") == 0 && i + 1 < argc) {
+            boost_alpha = (float)std::atof(argv[++i]);
+        }
+    }
+
+    // Key phrases from a file: one phrase per line, blank lines and '#'
+    // comments skipped, so a boost list can be kept under version control.
+    if (!boost_file.empty()) {
+        std::ifstream in(boost_file);
+        if (!in) {
+            std::fprintf(stderr,
+                "parakeet-cli: failed to open --boost-file %s\n",
+                boost_file.c_str());
+            return 2;
+        }
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            size_t b = line.find_first_not_of(" \t");
+            if (b == std::string::npos || line[b] == '#') continue;
+            const size_t e = line.find_last_not_of(" \t");
+            boost_phrases.push_back(line.substr(b, e - b + 1));
         }
     }
     if (model.empty() || input.empty()) {
@@ -235,7 +264,13 @@ static int cmd_transcribe(int argc, char** argv) {
             "usage: parakeet-cli transcribe --model <m.gguf> --input <wav|-> "
             "[--decoder ctc|tdt] [--lang <locale>] [--stream] [--timestamps] "
             "[--threads N] [--json] "
-            "[--beam-size N [--nbest N] [--no-score-norm]]\n");
+            "[--beam-size N [--nbest N] [--no-score-norm]] "
+            "[--boost <phrase>]... [--boost-file <f>] [--boost-alpha A]\n");
+        return 2;
+    }
+    if (stream && !boost_phrases.empty()) {
+        std::fprintf(stderr,
+            "parakeet-cli: --boost is not supported with --stream\n");
         return 2;
     }
     // Apply the thread override (offline + streaming graph compute). When unset
@@ -323,10 +358,25 @@ static int cmd_transcribe(int argc, char** argv) {
                         "parakeet-cli: failed to load model %s\n", model.c_str());
                     return 1;
                 }
+                pk::BoostingTree boost_tree;
+                pk::BoostingConfig boost;
+                if (!boost_phrases.empty()) {
+                    pk::BoostingSpec spec;
+                    spec.phrases = boost_phrases;
+                    spec.alpha = boost_alpha;
+                    std::vector<std::string> rejected;
+                    boost_tree = m->build_boosting_tree(spec, &rejected);
+                    for (const std::string& phrase : rejected)
+                        std::fprintf(stderr,
+                            "parakeet-cli: warning: cannot tokenize boost "
+                            "phrase '%s' (skipped)\n", phrase.c_str());
+                    boost.tree = &boost_tree;
+                    boost.alpha = boost_alpha;
+                }
                 std::vector<pk::NBestTranscription> hypotheses =
                     m->transcribe_pcm_nbest(
                         audio.samples, audio.sample_rate,
-                        beam_size, nbest, score_norm, lang);
+                        beam_size, nbest, score_norm, lang, boost);
                 std::string output = pk::nbest_transcriptions_to_json(
                     hypotheses, beam_size, score_norm, model_frame_sec(*m));
                 std::printf("%s\n", output.c_str());
@@ -343,6 +393,28 @@ static int cmd_transcribe(int argc, char** argv) {
             std::fprintf(stderr,
                 "parakeet-cli: failed to load model %s\n", model.c_str());
             return 1;
+        }
+        if (!boost_phrases.empty()) {
+            std::vector<const char*> raw;
+            raw.reserve(boost_phrases.size());
+            for (const std::string& phrase : boost_phrases)
+                raw.push_back(phrase.c_str());
+            const int accepted = parakeet_capi_set_boost_phrases(
+                ctx, raw.data(), (int)raw.size(), boost_alpha,
+                /*context_score=*/0.0f, /*depth_scaling=*/0.0f);
+            if (accepted < 0) {
+                std::fprintf(stderr,
+                    "parakeet-cli: failed to set boost phrases: %s\n",
+                    parakeet_capi_last_error(ctx));
+                parakeet_capi_free(ctx);
+                return 1;
+            }
+            if (accepted < (int)raw.size()) {
+                std::fprintf(stderr,
+                    "parakeet-cli: warning: %d of %d boost phrases could not "
+                    "be tokenized and were skipped\n",
+                    (int)raw.size() - accepted, (int)raw.size());
+            }
         }
         char* output = parakeet_capi_transcribe_path_nbest_json(
             ctx, input.c_str(), beam_size, nbest, score_norm ? 1 : 0,
@@ -1370,6 +1442,8 @@ int main(int argc, char** argv) {
         "[--decoder ctc|tdt] [--lang <locale>] [--stream] [--timestamps] "
         "[--threads N] [--json] "
         "[--beam-size N [--nbest N] [--no-score-norm]]\n"
+        "      word boosting (offline): [--boost <phrase>]... "
+        "[--boost-file <file>] [--boost-alpha A]\n"
         "  parakeet-cli quantize <in.gguf> <out.gguf> "
         "<q4_0|q5_0|q8_0|q4_k|q5_k|q6_k>\n"
         "  parakeet-cli bench --model <model.gguf> --manifest <file> "

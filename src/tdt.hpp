@@ -1,4 +1,5 @@
 #pragma once
+#include "boosting_tree.hpp"
 #include "prediction.hpp"
 #include "joint.hpp"
 #include "decode_types.hpp"
@@ -71,11 +72,18 @@ struct TdtBeamHypothesis {
 // the token slice logits[0:vocab+1] (excluding the TDT duration logits), span =
 // durations[d_k] (the predicted duration applied to the token). The id-only path
 // (tokens == nullptr) is unchanged.
+// `boost` optionally applies context biasing (see BoostingConfig). NeMo's
+// greedy GPU-PB is two-stage — pick the argmax, then rescore the non-blank
+// tokens through the tree and pick again — which is what the implementation
+// does. Only the TOKEN slice is boosted; duration logits are never touched,
+// so biasing cannot distort TDT timing. An inactive config leaves the greedy
+// path byte-for-byte unchanged.
 std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
                                 const std::vector<float>& enc, int T, int enc_hidden,
                                 const std::vector<int32_t>& durations,
                                 int blank_id, int max_symbols,
-                                std::vector<TokenInfo>* tokens = nullptr);
+                                std::vector<TokenInfo>* tokens = nullptr,
+                                const BoostingConfig& boost = {});
 
 // Sequence-level beam search for TDT models, matching NeMo BeamTDTInfer's
 // `default_beam_search`:
@@ -93,11 +101,20 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
 // This is an opt-in offline decoder. The existing tdt_greedy path is not used
 // or modified. `beam_size` and `nbest` must be positive, with nbest <=
 // beam_size. At most `nbest` hypotheses are returned.
+//
+// `boost` optionally applies context biasing (see BoostingConfig). Each
+// hypothesis carries its own boosting-tree state, so a phrase partially matched
+// on one beam does not leak its reward onto another; the shallow-fusion term
+// steers WHICH hypotheses survive pruning, which is why beam search benefits
+// far more from biasing than greedy does. Returned `score` values are the
+// BOOSTED scores (that is what ranked the hypotheses); only the token slice is
+// biased, never the durations.
 std::vector<TdtBeamHypothesis> tdt_beam_search(
     const PredictionNet& pred, const Joint& joint,
     const std::vector<float>& enc, int T, int enc_hidden,
     const std::vector<int32_t>& durations, int blank_id,
-    int beam_size, int nbest, bool score_norm = true);
+    int beam_size, int nbest, bool score_norm = true,
+    const BoostingConfig& boost = {});
 
 namespace detail {
 

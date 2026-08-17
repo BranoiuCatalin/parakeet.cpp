@@ -1,4 +1,5 @@
 #pragma once
+#include "boosting_tree.hpp"   // pk::BoostingTree
 #include "parakeet.h"          // pk::Decoder
 #include "model_loader.hpp"
 #include "tdt.hpp"             // pk::TdtBeamToken
@@ -9,6 +10,21 @@
 #include <vector>
 
 namespace pk {
+
+// Context-biasing request: the user's key phrases as plain text, plus NeMo's
+// GPU-PB tuning knobs. Compile it against a loaded model with
+// Model::build_boosting_tree(), which tokenizes each phrase with the model's own
+// SentencePiece vocabulary.
+struct BoostingSpec {
+    // Key phrases ("Kubernetes", "Jane Doe", "parakeet dot cpp"). Case matters:
+    // English Parakeet checkpoints emit lowercase, so lowercase phrases there.
+    std::vector<std::string> phrases;
+    // Shallow-fusion weight (NeMo `boosting_tree_alpha`). 0 disables boosting.
+    // Start around 1-3 and raise until key phrases appear without the decoder
+    // forcing them into unrelated audio.
+    float alpha = 0.0f;
+    BoostingTree::Params params{};
+};
 
 // One text hypothesis returned by the opt-in offline TDT N-best path.
 struct NBestTranscription {
@@ -101,15 +117,32 @@ public:
     // Offline TDT beam search. These methods are intentionally separate from
     // the greedy Decoder selector: they require a TDT duration table and return
     // up to `nbest` ranked hypotheses with token emission frames/durations.
+    // `boost` optionally applies context biasing to the beam search (see
+    // BoostingSpec / pk::BoostingTree). Beam search is the strongest biasing
+    // path: a boosted key phrase that loses an early frame can still win once
+    // later tokens confirm it, which greedy decoding cannot recover.
     std::vector<NBestTranscription> transcribe_pcm_nbest(
         const std::vector<float>& pcm, int sample_rate,
         int beam_size, int nbest, bool score_norm = true,
-        const std::string& target_lang = "") const;
+        const std::string& target_lang = "",
+        const BoostingConfig& boost = {}) const;
 
     std::vector<NBestTranscription> transcribe_path_nbest(
         const std::string& wav_path,
         int beam_size, int nbest, bool score_norm = true,
-        const std::string& target_lang = "") const;
+        const std::string& target_lang = "",
+        const BoostingConfig& boost = {}) const;
+
+    // Compile text key phrases into a boosting tree using THIS model's
+    // SentencePiece vocabulary. Build once and reuse across calls — the tree is
+    // independent of the audio, and rebuilding per utterance is pure waste.
+    //
+    // Phrases that cannot be tokenized are skipped rather than silently
+    // boosted as nothing; when `rejected` is non-null each such phrase is
+    // appended to it so callers can warn the user.
+    BoostingTree build_boosting_tree(
+        const BoostingSpec& spec,
+        std::vector<std::string>* rejected = nullptr) const;
 
     // Batched timestamped transcription. Each clip is resampled to 16 kHz if
     // needed, all run through the batched encoder; decode + timestamp extraction
@@ -152,7 +185,8 @@ private:
 
     std::vector<NBestTranscription> transcribe_16k_nbest(
         const std::vector<float>& pcm16k, int beam_size, int nbest,
-        bool score_norm, const std::string& target_lang) const;
+        bool score_norm, const std::string& target_lang,
+        const BoostingConfig& boost) const;
 
     // Core orchestration for transcribe_pcm_ctc_logits: 16 kHz mono PCM -> CTC
     // log-prob matrix. Mirrors transcribe_16k through the encoder, then runs

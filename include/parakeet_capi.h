@@ -187,6 +187,49 @@ char* parakeet_capi_transcribe_pcm_nbest_json(
     parakeet_ctx* ctx, const float* samples, int n_samples, int sample_rate,
     int beam_size, int nbest, int score_norm, const char* target_lang);
 
+// ---------------------------------------------------------------------------
+// Context biasing / word boosting (a CPU port of NeMo's GPU-PB phrase-boosting
+// tree, arXiv 2508.07014). Raises the decoder's likelihood of emitting
+// caller-supplied key phrases — names, jargon, product terms — without
+// retraining, by rescoring tokens during decoding:
+//
+//     score = acoustic_log_prob + alpha * boost
+//
+// The phrase list is attached to the CONTEXT, compiled once into a tree using
+// the model's own SentencePiece vocabulary, and then reused by every subsequent
+// transcribe call on that context. Attach it once after loading, not per call.
+//
+// Applies to the TDT/RNNT beam path (parakeet_capi_transcribe_*_nbest_json) and
+// the greedy TDT + CTC paths. Beam search benefits most: it can recover a key
+// phrase whose first token the acoustic model scored poorly, which greedy
+// decoding, committing at each frame, cannot.
+// ---------------------------------------------------------------------------
+
+// Attach `n_phrases` key phrases (UTF-8, one phrase per entry; a phrase may
+// contain spaces) to `ctx`. `alpha` is the shallow-fusion weight (NeMo
+// `boosting_tree_alpha`); 1-3 is a sensible starting range, tune upward until
+// key phrases surface without being forced into unrelated audio.
+//
+// `context_score` (NeMo default 1.0) is the per-arc reward and `depth_scaling`
+// (2.0 for CTC/RNN-T/TDT) scales it with match depth. Pass 0 for either to take
+// the default.
+//
+// Match the model's casing: English Parakeet checkpoints emit lowercase, so
+// lowercase the phrases for them.
+//
+// Returns the number of phrases ACCEPTED (>= 0), or -1 on error (see
+// parakeet_capi_last_error). Phrases the model's vocabulary cannot represent
+// are skipped, so a return value below `n_phrases` means some were dropped.
+// Replaces any previously attached list. Passing n_phrases == 0 (or alpha == 0)
+// clears biasing and restores the exact unboosted decode path.
+int parakeet_capi_set_boost_phrases(parakeet_ctx* ctx,
+                                    const char* const* phrases, int n_phrases,
+                                    float alpha, float context_score,
+                                    float depth_scaling);
+
+// Remove any attached phrase list. Equivalent to passing n_phrases == 0.
+void parakeet_capi_clear_boost_phrases(parakeet_ctx* ctx);
+
 // Run mel + encoder + CTC head on in-memory mono float PCM and return the
 // log-prob matrix instead of decoded text, for callers that run their own
 // external decoder (e.g. pyctcdecode + a KenLM n-gram LM + hotwords) on top of

@@ -20,7 +20,8 @@ float max_prob_conf(float max_logprob, int num_classes) {
 
 std::vector<int32_t> ctc_greedy(const std::vector<float>& logits,
                                 int T, int vocab_plus_1, int blank_id,
-                                std::vector<TokenInfo>* tokens) {
+                                std::vector<TokenInfo>* tokens,
+                                const BoostingConfig& boost) {
     std::vector<int32_t> out;
     if (tokens) tokens->clear();
     if (T <= 0 || vocab_plus_1 <= 0) return out;
@@ -49,6 +50,7 @@ std::vector<int32_t> ctc_greedy(const std::vector<float>& logits,
     int  prev_peak = 0;          // emit frame (peak) of the previously emitted token.
     bool have_prev = false;      // any token emitted yet?
     float cur_run_min = 1.0f;    // running min per-frame conf over the current run.
+    BoostingTree::State boost_state = BoostingTree::kRoot;
 
     for (int t = 0; t < T; ++t) {
         const float* row = logits.data() + (size_t)t * vocab_plus_1;
@@ -60,8 +62,38 @@ std::vector<int32_t> ctc_greedy(const std::vector<float>& logits,
             if (row[v] > best_val) { best_val = row[v]; p = v; }
         }
 
+        // Context biasing, second stage: rescore non-blank classes through the
+        // tree and re-take the argmax against the UNBOOSTED blank. `best_val`
+        // deliberately keeps the acoustic log-prob of the selected class so the
+        // reported confidence stays a real probability rather than a boosted
+        // score that could exceed 1.
+        BoostingTree::State boost_next = boost_state;
+        if (boost.active()) {
+            float best_score = row[blank_id];
+            int32_t best_token = (int32_t)blank_id;
+            BoostingTree::State best_next = BoostingTree::kRoot;
+            for (int v = 0; v < vocab_plus_1; ++v) {
+                if (v == blank_id) continue;
+                BoostingTree::State next = BoostingTree::kRoot;
+                const float delta =
+                    boost.tree->advance(boost_state, (int32_t)v, &next);
+                const float score = row[v] + boost.alpha * delta;
+                if (score > best_score) {
+                    best_score = score;
+                    best_token = (int32_t)v;
+                    best_next = next;
+                }
+            }
+            p = best_token;
+            best_val = row[p];
+            boost_next = (p == blank_id) ? boost_state : best_next;
+        }
+
         const bool emit = (p != previous || previous == blank_id) && p != blank_id;
         if (emit) {
+            // Advance the phrase only on a genuine emission: CTC's collapse rule
+            // means a repeated argmax is the SAME token, not a second one.
+            boost_state = boost_next;
             out.push_back(p);
             if (tokens) {
                 // Close out the PREVIOUS token's accumulated run-min conf before

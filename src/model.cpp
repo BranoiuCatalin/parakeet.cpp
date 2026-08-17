@@ -525,9 +525,28 @@ std::vector<Transcription> Model::transcribe_pcm_batch_with_timestamps(
     return transcribe_16k_batch_with_timestamps(r, decoder, target_lang);
 }
 
+BoostingTree Model::build_boosting_tree(
+        const BoostingSpec& spec,
+        std::vector<std::string>* rejected) const {
+    const std::vector<std::string>& pieces = loader_.tokenizer_pieces();
+
+    std::vector<std::vector<int32_t>> tokenized;
+    tokenized.reserve(spec.phrases.size());
+    for (const std::string& phrase : spec.phrases) {
+        std::vector<int32_t> ids = encode_phrase_tokens(pieces, phrase);
+        if (ids.empty()) {
+            if (rejected) rejected->push_back(phrase);
+            continue;
+        }
+        tokenized.push_back(std::move(ids));
+    }
+    return BoostingTree(tokenized, spec.params);
+}
+
 std::vector<NBestTranscription> Model::transcribe_16k_nbest(
         const std::vector<float>& pcm16k, int beam_size, int nbest,
-        bool score_norm, const std::string& target_lang) const {
+        bool score_norm, const std::string& target_lang,
+        const BoostingConfig& boost) const {
     const ParakeetConfig& cfg = loader_.config();
 
     const int prompt_index = resolve_prompt_index(target_lang);
@@ -545,7 +564,7 @@ std::vector<NBestTranscription> Model::transcribe_16k_nbest(
     std::vector<TdtBeamHypothesis> beam = tdt_beam_search(
         pred, joint, enc_row, encoded.frames, encoded.d_model,
         cfg.tdt_durations, (int)cfg.blank_id,
-        beam_size, nbest, score_norm);
+        beam_size, nbest, score_norm, boost);
 
     std::vector<NBestTranscription> result;
     result.reserve(beam.size());
@@ -570,28 +589,30 @@ std::vector<NBestTranscription> Model::transcribe_16k_nbest(
 std::vector<NBestTranscription> Model::transcribe_pcm_nbest(
         const std::vector<float>& pcm, int sample_rate,
         int beam_size, int nbest, bool score_norm,
-        const std::string& target_lang) const {
+        const std::string& target_lang,
+        const BoostingConfig& boost) const {
     validate_nbest_request(loader_.config(), beam_size, nbest);
     if (sample_rate <= 0)
         throw std::runtime_error("parakeet: invalid sample_rate");
     if (sample_rate == 16000)
         return transcribe_16k_nbest(
-            pcm, beam_size, nbest, score_norm, target_lang);
+            pcm, beam_size, nbest, score_norm, target_lang, boost);
     return transcribe_16k_nbest(
         resample_linear(pcm, sample_rate, 16000),
-        beam_size, nbest, score_norm, target_lang);
+        beam_size, nbest, score_norm, target_lang, boost);
 }
 
 std::vector<NBestTranscription> Model::transcribe_path_nbest(
         const std::string& wav_path, int beam_size, int nbest,
-        bool score_norm, const std::string& target_lang) const {
+        bool score_norm, const std::string& target_lang,
+        const BoostingConfig& boost) const {
     validate_nbest_request(loader_.config(), beam_size, nbest);
     Audio audio;
     if (!load_audio_16k_mono(wav_path, audio))
         throw std::runtime_error(
             "parakeet: failed to load audio: " + wav_path);
     return transcribe_16k_nbest(
-        audio.samples, beam_size, nbest, score_norm, target_lang);
+        audio.samples, beam_size, nbest, score_norm, target_lang, boost);
 }
 
 std::string Model::transcribe_pcm(const std::vector<float>& pcm, int sample_rate,

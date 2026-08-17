@@ -1,4 +1,5 @@
 #pragma once
+#include "boosting_tree.hpp"   // pk::BoostingConfig
 #include "decode_types.hpp"
 #include <cstdint>
 #include <vector>
@@ -23,8 +24,16 @@ namespace pk {
 // (NeMo `start_offset`), conf = min over the token's consecutive argmax run of
 // the per-frame max_prob confidence, span = 1. The id-only path (tokens ==
 // nullptr) is unchanged.
+//
+// `boost` optionally applies context biasing (NeMo GPU-PB shallow fusion, see
+// BoostingConfig): per frame the non-blank scores are rescored through the tree
+// and the argmax retaken. The tree state advances only on a frame that EMITS a
+// new token — repeated frames of one token and blank frames leave it alone, so
+// a token held across five frames advances the phrase once, not five times.
+// An inactive config leaves this function's output bit-identical.
 std::vector<int32_t> ctc_greedy(const std::vector<float>& logits,
                                 int T, int vocab_plus_1, int blank_id,
-                                std::vector<TokenInfo>* tokens = nullptr);
+                                std::vector<TokenInfo>* tokens = nullptr,
+                                const BoostingConfig& boost = {});
 
 } // namespace pk

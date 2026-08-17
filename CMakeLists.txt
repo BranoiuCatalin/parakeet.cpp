@@ -92,6 +92,7 @@ set(PARAKEET_SRC
     src/transducer_batch.cpp
     src/tokenizer.cpp
     src/search.cpp
+    src/boosting_tree.cpp
     src/transcription.cpp)
 
 if(PARAKEET_SHARED)

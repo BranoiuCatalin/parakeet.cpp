@@ -12,7 +12,8 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
                                 const std::vector<float>& enc, int T, int enc_hidden,
                                 const std::vector<int32_t>& durations,
                                 int blank_id, int max_symbols,
-                                std::vector<TokenInfo>* tokens) {
+                                std::vector<TokenInfo>* tokens,
+                                const BoostingConfig& boost) {
     assert((int)enc.size() == (size_t)T * enc_hidden);
     assert(!durations.empty());
 
@@ -29,6 +30,8 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
     PredState committed = pred.zero_state();
     int32_t last_token = -1;      // -1 sentinel: nothing emitted yet -> SOS.
     bool emitted_any = false;
+    // Context-biasing position, advanced only when a non-blank token is emitted.
+    BoostingTree::State boost_state = BoostingTree::kRoot;
 
     // Precompute the encoder projection over ALL frames ONCE (one matmul on the
     // persistent backend), reused for every step. The per-step joint below is a
@@ -77,9 +80,39 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
                               g.data(), (int)g.size(), logits);
 
             // Split: token logits [0, token_count), duration logits [token_count, V_plus).
-            const int k   = decode_argmax(logits.data(), token_count);
+            int k = decode_argmax(logits.data(), token_count);
             const int d_k = decode_argmax(logits.data() + token_count, num_dur);
             skip = durations[d_k];
+
+            // Context biasing, NeMo GPU-PB two-stage greedy: take the argmax
+            // above, then rescore the non-blank tokens through the boosting
+            // tree and re-select. Comparing boosted non-blanks against the
+            // UNBOOSTED blank keeps blank emission honest — biasing may only
+            // change which word is emitted, never whether one is.
+            //
+            // Greedy commits irreversibly at each step, so a phrase whose first
+            // token the acoustic model scores very low can still be missed here;
+            // beam search is the stronger biasing path.
+            BoostingTree::State boost_next = boost_state;
+            if (boost.active()) {
+                float best_score = logits[(size_t)blank_id];
+                int best_token = blank_id;
+                BoostingTree::State best_next = BoostingTree::kRoot;
+                for (int token = 0; token < blank_id; ++token) {
+                    BoostingTree::State next = BoostingTree::kRoot;
+                    const float delta = boost.tree->advance(
+                        boost_state, (int32_t)token, &next);
+                    const float score =
+                        logits[(size_t)token] + boost.alpha * delta;
+                    if (score > best_score) {
+                        best_score = score;
+                        best_token = token;
+                        best_next = next;
+                    }
+                }
+                k = best_token;
+                boost_next = (best_token == blank_id) ? boost_state : best_next;
+            }
 
             // Commit state + last_token ONLY when k != blank.
             if (k != blank_id) {
@@ -100,6 +133,7 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
                 committed = out_state;   // carry the step's new (h', c')
                 emitted_any = true;
                 g_valid = false;         // committed state advanced -> recompute g
+                boost_state = boost_next;
             }
             // else: discard out_state; committed/last_token unchanged (g stays valid).
 
@@ -152,6 +186,9 @@ struct BeamState {
     int32_t last_token = -1;
     bool emitted_any = false;
     bool pred_valid = false;
+    // Per-hypothesis context-biasing position. Each beam tracks its own partial
+    // phrase match; kRoot when boosting is off, which costs one int to copy.
+    BoostingTree::State boost_state = BoostingTree::kRoot;
 };
 
 struct RankedIndex {
@@ -200,6 +237,11 @@ float log_add_exp(float a, float b) {
 bool same_path(const BeamState& a, const BeamState& b) {
     if (a.last_frame != b.last_frame || a.hyp.tokens.size() != b.hyp.tokens.size())
         return false;
+    // Identical token sequences always reach the same boosting state, so this
+    // never splits a merge that should happen; it is a guard against silently
+    // logaddexp-ing two hypotheses that owe different refunds.
+    if (a.boost_state != b.boost_state)
+        return false;
     for (size_t i = 0; i < a.hyp.tokens.size(); ++i)
         if (a.hyp.tokens[i].id != b.hyp.tokens[i].id)
             return false;
@@ -239,7 +281,8 @@ std::vector<TdtBeamHypothesis> tdt_beam_search(
     const PredictionNet& pred, const Joint& joint,
     const std::vector<float>& enc, int T, int enc_hidden,
     const std::vector<int32_t>& durations, int blank_id,
-    int beam_size, int nbest, bool score_norm) {
+    int beam_size, int nbest, bool score_norm,
+    const BoostingConfig& boost) {
     if (T < 0 || enc_hidden <= 0 ||
         enc.size() != (size_t)T * (size_t)enc_hidden)
         throw std::invalid_argument("tdt_beam_search: invalid encoder shape");
@@ -343,20 +386,49 @@ std::vector<TdtBeamHypothesis> tdt_beam_search(
                 top_k(duration_logp.data(), num_durations, duration_beam);
 
             struct Pair {
-                float score;
+                float score;          // boosted: ranks and prunes the expansion
+                float acoustic;       // unboosted: guards the zero-duration rule
                 int token;
                 int duration_idx;
+                BoostingTree::State boost_state;
             };
             std::vector<Pair> pairs;
+
+            // Context biasing (NeMo GPU-PB shallow fusion). Boost the whole
+            // token slice BEFORE top_k so a key-phrase token that the acoustic
+            // model ranked outside the beam can still be selected — that
+            // promotion is the entire point of biasing under beam search.
+            // Blank is excluded (top_k runs over [0, blank_id)) and durations
+            // are untouched.
+            std::vector<float> boosted_token_logp;
+            std::vector<BoostingTree::State> boost_next;
+            const float* token_rank_scores = token_logp.data();
+            if (boost.active()) {
+                boosted_token_logp.resize((size_t)blank_id);
+                boost_next.resize((size_t)blank_id);
+                for (int token = 0; token < blank_id; ++token) {
+                    BoostingTree::State next = BoostingTree::kRoot;
+                    const float delta = boost.tree->advance(
+                        best.boost_state, (int32_t)token, &next);
+                    boosted_token_logp[(size_t)token] =
+                        token_logp[(size_t)token] + boost.alpha * delta;
+                    boost_next[(size_t)token] = next;
+                }
+                token_rank_scores = boosted_token_logp.data();
+            }
+
             const std::vector<RankedIndex> best_tokens =
-                top_k(token_logp.data(), blank_id, token_beam);
+                top_k(token_rank_scores, blank_id, token_beam);
             pairs.reserve(best_tokens.size() * best_durations.size());
             for (const RankedIndex& duration : best_durations)
                 for (const RankedIndex& token : best_tokens)
                     pairs.push_back(Pair{
                         duration.score + token.score,
+                        duration.score + token_logp[(size_t)token.index],
                         token.index,
-                        duration.index});
+                        duration.index,
+                        boost.active() ? boost_next[(size_t)token.index]
+                                       : BoostingTree::kRoot});
             std::partial_sort(
                 pairs.begin(),
                 pairs.begin() + std::min(token_beam, (int)pairs.size()),
@@ -373,8 +445,12 @@ std::vector<TdtBeamHypothesis> tdt_beam_search(
                 const int duration = durations[pair.duration_idx];
                 BeamState child = best;
                 child.hyp.score += pair.score;
-                if (duration == 0 &&
-                    !(child.hyp.score < best.hyp.score)) {
+                // Progress guard against a malformed model looping on duration
+                // 0. Tested on the ACOUSTIC delta: a boost is a deliberate
+                // positive reward and may legitimately make a zero-duration
+                // expansion score higher than its parent, which is not the
+                // pathology this check exists to catch.
+                if (duration == 0 && !(pair.acoustic < 0.0f)) {
                     throw std::runtime_error(
                         "tdt_beam_search: zero-duration expansion "
                         "did not reduce score");
@@ -386,6 +462,7 @@ std::vector<TdtBeamHypothesis> tdt_beam_search(
                 child.emitted_any = true;
                 child.pred_valid = false;
                 child.last_frame += duration;
+                child.boost_state = pair.boost_state;
                 if (duration == 0)
                     current_hyps.push_back(std::move(child));
                 else
@@ -437,6 +514,15 @@ std::vector<TdtBeamHypothesis> tdt_beam_search(
                     kept_hyps.resize(beam);
             }
         }
+    }
+
+    // Settle unfinished phrase matches before the final ranking: a hypothesis
+    // that ends part-way into a key phrase refunds the reward it accumulated,
+    // so a dangling prefix cannot win the beam on boost alone.
+    if (boost.active()) {
+        for (BeamState& hyp : kept_hyps)
+            hyp.hyp.score +=
+                boost.alpha * boost.tree->final_score(hyp.boost_state);
     }
 
     std::sort(kept_hyps.begin(), kept_hyps.end(),
