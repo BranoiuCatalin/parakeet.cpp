@@ -1,6 +1,7 @@
 #include "parakeet.h"
 #include "parakeet_capi.h"
 #include "model.hpp"
+#include "tokenizer.hpp"   // pk::encode_phrase_tokens (--boost-debug)
 #include "model_loader.hpp"
 #include "audio_io.hpp"
 #include "streaming.hpp"
@@ -115,6 +116,42 @@ static float model_frame_sec(const pk::Model& model) {
     return (float)cfg.hop_length * (float)cfg.subsampling_factor / (float)cfg.sample_rate;
 }
 
+// Print how each boost phrase was tokenized against the model's vocabulary.
+//
+// Worth checking whenever a phrase does not seem to boost. Phrase tokenization
+// is greedy longest-match, while SentencePiece itself segments by Viterbi over
+// unigram probabilities (which the GGUF does not store). When the two disagree,
+// the boosting tree waits for a token sequence the decoder never emits and the
+// phrase silently fails to boost. Comparing these pieces against the token ids
+// in `--json` output for audio that DOES contain the phrase shows the mismatch
+// directly.
+static void print_boost_tokenization(
+        const pk::Model& model, const std::vector<std::string>& phrases) {
+    const std::vector<std::string>& pieces = model.loader().tokenizer_pieces();
+    std::fprintf(stderr, "boost phrase tokenization (%zu phrase(s)):\n",
+                 phrases.size());
+    for (const std::string& phrase : phrases) {
+        const std::vector<int32_t> ids =
+            pk::encode_phrase_tokens(pieces, phrase);
+        if (ids.empty()) {
+            std::fprintf(stderr,
+                "  %-28s -> UNTOKENIZABLE (skipped; not in this vocabulary)\n",
+                phrase.c_str());
+            continue;
+        }
+        std::string rendered;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (i) rendered += " | ";
+            rendered += pieces[(size_t)ids[i]];
+        }
+        std::fprintf(stderr, "  %-28s -> %s   [", phrase.c_str(),
+                     rendered.c_str());
+        for (size_t i = 0; i < ids.size(); ++i)
+            std::fprintf(stderr, "%s%d", i ? "," : "", (int)ids[i]);
+        std::fprintf(stderr, "]\n");
+    }
+}
+
 // Cache-aware streaming transcription for the EOU streaming model. Feeds the WAV
 // to a pk::StreamingSession in the model's exact chunk schedule, printing partial
 // text incrementally and `[EOU @ <t>s]` / `[EOB @ <t>s]` markers when events
@@ -208,6 +245,7 @@ static int cmd_transcribe(int argc, char** argv) {
     std::vector<std::string> boost_phrases;
     std::string boost_file;
     float boost_alpha = 2.0f;   // sensible default once phrases are supplied
+    bool boost_debug = false;
     for (int i = 0; i < argc; ++i) {
         if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             model = argv[++i];
@@ -237,6 +275,8 @@ static int cmd_transcribe(int argc, char** argv) {
             boost_file = argv[++i];
         } else if (std::strcmp(argv[i], "--boost-alpha") == 0 && i + 1 < argc) {
             boost_alpha = (float)std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--boost-debug") == 0) {
+            boost_debug = true;
         }
     }
 
@@ -265,7 +305,8 @@ static int cmd_transcribe(int argc, char** argv) {
             "[--decoder ctc|tdt] [--lang <locale>] [--stream] [--timestamps] "
             "[--threads N] [--json] "
             "[--beam-size N [--nbest N] [--no-score-norm]] "
-            "[--boost <phrase>]... [--boost-file <f>] [--boost-alpha A]\n");
+            "[--boost <phrase>]... [--boost-file <f>] [--boost-alpha A] "
+            "[--boost-debug]\n");
         return 2;
     }
     if (stream && !boost_phrases.empty()) {
@@ -361,6 +402,8 @@ static int cmd_transcribe(int argc, char** argv) {
                 pk::BoostingTree boost_tree;
                 pk::BoostingConfig boost;
                 if (!boost_phrases.empty()) {
+                    if (boost_debug)
+                        print_boost_tokenization(*m, boost_phrases);
                     pk::BoostingSpec spec;
                     spec.phrases = boost_phrases;
                     spec.alpha = boost_alpha;
@@ -395,6 +438,13 @@ static int cmd_transcribe(int argc, char** argv) {
             return 1;
         }
         if (!boost_phrases.empty()) {
+            if (boost_debug) {
+                // The C-API context does not expose the vocabulary, so load the
+                // model once more purely to report the tokenization. Diagnostic
+                // only — the transcription below still runs through the C-API.
+                if (std::unique_ptr<pk::Model> dbg = pk::Model::load(model))
+                    print_boost_tokenization(*dbg, boost_phrases);
+            }
             std::vector<const char*> raw;
             raw.reserve(boost_phrases.size());
             for (const std::string& phrase : boost_phrases)
@@ -1443,7 +1493,7 @@ int main(int argc, char** argv) {
         "[--threads N] [--json] "
         "[--beam-size N [--nbest N] [--no-score-norm]]\n"
         "      word boosting (offline): [--boost <phrase>]... "
-        "[--boost-file <file>] [--boost-alpha A]\n"
+        "[--boost-file <file>] [--boost-alpha A] [--boost-debug]\n"
         "  parakeet-cli quantize <in.gguf> <out.gguf> "
         "<q4_0|q5_0|q8_0|q4_k|q5_k|q6_k>\n"
         "  parakeet-cli bench --model <model.gguf> --manifest <file> "

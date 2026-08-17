@@ -134,6 +134,26 @@ parakeet-cli transcribe \
 Phrases the vocabulary cannot represent are skipped with a warning on stderr
 rather than silently ignored.
 
+### Diagnosing a phrase that does not boost
+
+`--boost-debug` prints how each phrase was tokenized:
+
+```sh
+parakeet-cli transcribe --model parakeet-tdt_ctc-110m.gguf \
+  --input audio.wav --beam-size 4 --boost "kubernetes" --boost-debug
+```
+
+```
+boost phrase tokenization (1 phrase(s)):
+  kubernetes                   -> ▁ku | bern | etes   [412,3201,88]
+```
+
+Compare those pieces against the token ids the model actually emits for audio
+that does contain the phrase (`--json` reports per-token ids). If they differ,
+the tree is waiting on a sequence the decoder never produces — see
+[Limitations](#limitations) — and boosting that phrase silently does nothing.
+Boosting the emitted ids directly via `pk::BoostingTree` is the workaround.
+
 ## C API
 
 The phrase list attaches to the context and is compiled once, then reused by
