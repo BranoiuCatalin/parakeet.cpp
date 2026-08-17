@@ -140,7 +140,8 @@ static EncodedAudio encode_16k(const ModelLoader& loader,
 // into a transcript. Mirrors the tail of transcribe_16k exactly.
 static std::string decode_enc_out(const ModelLoader& loader,
                                   const std::vector<float>& enc_out,
-                                  int d_model, int Tout, bool use_tdt) {
+                                  int d_model, int Tout, bool use_tdt,
+                                  const BoostingConfig& boost = {}) {
     const ParakeetConfig& cfg = loader.config();
     if (use_tdt) {
         std::vector<float> enc_row((size_t)Tout * d_model);
@@ -153,7 +154,8 @@ static std::string decode_enc_out(const ModelLoader& loader,
         std::vector<int32_t> ids;
         if (!cfg.tdt_durations.empty())
             ids = tdt_greedy(pred, joint, enc_row, Tout, d_model,
-                             cfg.tdt_durations, (int)cfg.blank_id, max_symbols);
+                             cfg.tdt_durations, (int)cfg.blank_id, max_symbols,
+                             /*tokens=*/nullptr, boost);
         else
             ids = rnnt_greedy(pred, joint, enc_row, Tout, d_model,
                               (int)cfg.blank_id, max_symbols);
@@ -170,7 +172,8 @@ static std::string decode_enc_out(const ModelLoader& loader,
 
 std::string Model::transcribe_16k(const std::vector<float>& pcm16k,
                                   Decoder decoder,
-                                  const std::string& target_lang) const {
+                                  const std::string& target_lang,
+                                  const BoostingConfig& boost) const {
     const ParakeetConfig& cfg = loader_.config();
     const int prompt_index = resolve_prompt_index(target_lang);
     EncodedAudio encoded = encode_16k(loader_, pcm16k, prompt_index);
@@ -180,7 +183,7 @@ std::string Model::transcribe_16k(const std::vector<float>& pcm16k,
         || (decoder == Decoder::kDefault && arch_prefers_tdt(cfg.arch));
 
     return decode_enc_out(loader_, encoded.channels_first,
-                          encoded.d_model, encoded.frames, use_tdt);
+                          encoded.d_model, encoded.frames, use_tdt, boost);
 }
 
 void Model::transcribe_16k_ctc_logits(const std::vector<float>& pcm16k,
@@ -387,7 +390,8 @@ std::vector<std::string> Model::transcribe_pcm_batch(
 // of transcribe_16k_with_timestamps exactly.
 static Transcription decode_enc_out_with_timestamps(
         const ModelLoader& loader, const std::vector<float>& enc_out,
-        int d_model, int Tout, bool use_tdt, float frame_sec) {
+        int d_model, int Tout, bool use_tdt, float frame_sec,
+        const BoostingConfig& boost = {}) {
     const ParakeetConfig& cfg = loader.config();
     Transcription result;
     std::vector<TokenInfo> toks;
@@ -401,7 +405,7 @@ static Transcription decode_enc_out_with_timestamps(
         const int max_symbols = (int)cfg.max_symbols;
         if (!cfg.tdt_durations.empty())
             tdt_greedy(pred, joint, enc_row, Tout, d_model, cfg.tdt_durations,
-                       (int)cfg.blank_id, max_symbols, &toks);
+                       (int)cfg.blank_id, max_symbols, &toks, boost);
         else
             rnnt_greedy(pred, joint, enc_row, Tout, d_model,
                         (int)cfg.blank_id, max_symbols, &toks);
@@ -430,7 +434,7 @@ static Transcription decode_enc_out_with_timestamps(
 
 Transcription Model::transcribe_16k_with_timestamps(
     const std::vector<float>& pcm16k, Decoder decoder,
-    const std::string& target_lang) const {
+    const std::string& target_lang, const BoostingConfig& boost) const {
     const ParakeetConfig& cfg = loader_.config();
     const int prompt_index = resolve_prompt_index(target_lang);
 
@@ -446,7 +450,7 @@ Transcription Model::transcribe_16k_with_timestamps(
 
     Transcription result = decode_enc_out_with_timestamps(
         loader_, encoded.channels_first, encoded.d_model, encoded.frames,
-        use_tdt, frame_sec);
+        use_tdt, frame_sec, boost);
     return result;
 }
 
@@ -616,15 +620,16 @@ std::vector<NBestTranscription> Model::transcribe_path_nbest(
 }
 
 std::string Model::transcribe_pcm(const std::vector<float>& pcm, int sample_rate,
-                                  Decoder decoder, const std::string& target_lang) const {
+                                  Decoder decoder, const std::string& target_lang,
+                                  const BoostingConfig& boost) const {
     if (sample_rate <= 0) {
         throw std::runtime_error("parakeet: invalid sample_rate");
     }
     if (sample_rate == 16000) {
-        return transcribe_16k(pcm, decoder, target_lang);
+        return transcribe_16k(pcm, decoder, target_lang, boost);
     }
     std::vector<float> pcm16k = resample_linear(pcm, sample_rate, 16000);
-    return transcribe_16k(pcm16k, decoder, target_lang);
+    return transcribe_16k(pcm16k, decoder, target_lang, boost);
 }
 
 void Model::transcribe_pcm_ctc_logits(const std::vector<float>& pcm, int sample_rate,
@@ -643,36 +648,38 @@ void Model::transcribe_pcm_ctc_logits(const std::vector<float>& pcm, int sample_
 }
 
 std::string Model::transcribe_path(const std::string& wav_path,
-                                   Decoder decoder, const std::string& target_lang) const {
+                                   Decoder decoder, const std::string& target_lang,
+                                   const BoostingConfig& boost) const {
     Audio audio;
     if (!load_audio_16k_mono(wav_path, audio)) {
         throw std::runtime_error("parakeet: failed to load audio: " + wav_path);
     }
     // load_audio_16k_mono already resamples to 16 kHz mono.
-    return transcribe_16k(audio.samples, decoder, target_lang);
+    return transcribe_16k(audio.samples, decoder, target_lang, boost);
 }
 
 Transcription Model::transcribe_with_timestamps(
     const std::vector<float>& pcm, int sample_rate, Decoder decoder,
-    const std::string& target_lang) const {
+    const std::string& target_lang, const BoostingConfig& boost) const {
     if (sample_rate <= 0) {
         throw std::runtime_error("parakeet: invalid sample_rate");
     }
     if (sample_rate == 16000) {
-        return transcribe_16k_with_timestamps(pcm, decoder, target_lang);
+        return transcribe_16k_with_timestamps(pcm, decoder, target_lang, boost);
     }
     std::vector<float> pcm16k = resample_linear(pcm, sample_rate, 16000);
-    return transcribe_16k_with_timestamps(pcm16k, decoder, target_lang);
+    return transcribe_16k_with_timestamps(pcm16k, decoder, target_lang, boost);
 }
 
 Transcription Model::transcribe_path_with_timestamps(
     const std::string& wav_path, Decoder decoder,
-    const std::string& target_lang) const {
+    const std::string& target_lang, const BoostingConfig& boost) const {
     Audio audio;
     if (!load_audio_16k_mono(wav_path, audio)) {
         throw std::runtime_error("parakeet: failed to load audio: " + wav_path);
     }
-    return transcribe_16k_with_timestamps(audio.samples, decoder, target_lang);
+    return transcribe_16k_with_timestamps(audio.samples, decoder, target_lang,
+                                          boost);
 }
 
 } // namespace pk

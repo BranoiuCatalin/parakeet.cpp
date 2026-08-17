@@ -55,22 +55,29 @@ public:
     // models (e.g. "en", "de", "auto"); empty -> the model default. It is
     // ignored by non-prompt models. Throws std::runtime_error on failure (e.g.
     // unsupported arch, or an unknown target_lang for a prompt model).
+    // `boost` optionally applies context biasing to the greedy TDT decoder
+    // (see BoostingSpec / pk::BoostingTree). Ignored by the CTC head, whose
+    // behavior is unchanged. Greedy commits at each step, so biasing is weaker
+    // here than in the beam path (transcribe_*_nbest).
     std::string transcribe_pcm(const std::vector<float>& pcm, int sample_rate,
                                Decoder decoder = Decoder::kDefault,
-                               const std::string& target_lang = "") const;
+                               const std::string& target_lang = "",
+                               const BoostingConfig& boost = {}) const;
 
     // Transcribe a WAV file (loaded + resampled to 16 kHz mono via
     // pk::load_audio_16k_mono). `target_lang` as in transcribe_pcm. Throws
     // std::runtime_error on failure.
     std::string transcribe_path(const std::string& wav_path,
                                 Decoder decoder = Decoder::kDefault,
-                                const std::string& target_lang = "") const;
+                                const std::string& target_lang = "",
+                                const BoostingConfig& boost = {}) const;
 
     // Core orchestration: 16 kHz mono PCM -> transcript. Public so language-aware
     // callers/tests can drive it directly with a resolved target_lang.
     std::string transcribe_16k(const std::vector<float>& pcm16k,
                                Decoder decoder = Decoder::kDefault,
-                               const std::string& target_lang = "") const;
+                               const std::string& target_lang = "",
+                               const BoostingConfig& boost = {}) const;
 
     // Resolve a target_lang (locale string) to a prompt index using the model's
     // dictionary. Empty string -> the model's default_lang. Returns -1 and is
@@ -106,13 +113,15 @@ public:
     Transcription transcribe_with_timestamps(
         const std::vector<float>& pcm, int sample_rate,
         Decoder decoder = Decoder::kDefault,
-        const std::string& target_lang = "") const;
+        const std::string& target_lang = "",
+        const BoostingConfig& boost = {}) const;
 
     // Convenience: transcribe a WAV file with timestamps + confidence.
     Transcription transcribe_path_with_timestamps(
         const std::string& wav_path,
         Decoder decoder = Decoder::kDefault,
-        const std::string& target_lang = "") const;
+        const std::string& target_lang = "",
+        const BoostingConfig& boost = {}) const;
 
     // Offline TDT beam search. These methods are intentionally separate from
     // the greedy Decoder selector: they require a TDT duration table and return
@@ -181,7 +190,8 @@ private:
     // two timestamp entry points.
     Transcription transcribe_16k_with_timestamps(
         const std::vector<float>& pcm16k, Decoder decoder,
-        const std::string& target_lang = "") const;
+        const std::string& target_lang = "",
+        const BoostingConfig& boost = {}) const;
 
     std::vector<NBestTranscription> transcribe_16k_nbest(
         const std::vector<float>& pcm16k, int beam_size, int nbest,

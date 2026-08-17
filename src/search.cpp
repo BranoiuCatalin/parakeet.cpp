@@ -67,18 +67,26 @@ std::vector<int32_t> ctc_greedy(const std::vector<float>& logits,
         // deliberately keeps the acoustic log-prob of the selected class so the
         // reported confidence stays a real probability rather than a boosted
         // score that could exceed 1.
+        //
+        // Classes are scanned in ascending index order keeping the incumbent on
+        // a tie (strict `>`), so with alpha == 0 the result is identical to the
+        // plain argmax above — including its lowest-index tie-break. Seeding the
+        // scan with blank would instead let blank win every tie.
         BoostingTree::State boost_next = boost_state;
         if (boost.active()) {
-            float best_score = row[blank_id];
-            int32_t best_token = (int32_t)blank_id;
+            float best_score = 0.0f;
+            int32_t best_token = -1;
             BoostingTree::State best_next = BoostingTree::kRoot;
             for (int v = 0; v < vocab_plus_1; ++v) {
-                if (v == blank_id) continue;
                 BoostingTree::State next = BoostingTree::kRoot;
-                const float delta =
-                    boost.tree->advance(boost_state, (int32_t)v, &next);
-                const float score = row[v] + boost.alpha * delta;
-                if (score > best_score) {
+                float score = row[v];
+                if (v == blank_id) {
+                    next = boost_state;      // blank never advances the phrase
+                } else {
+                    score += boost.alpha *
+                             boost.tree->advance(boost_state, (int32_t)v, &next);
+                }
+                if (best_token < 0 || score > best_score) {
                     best_score = score;
                     best_token = (int32_t)v;
                     best_next = next;
@@ -86,7 +94,7 @@ std::vector<int32_t> ctc_greedy(const std::vector<float>& logits,
             }
             p = best_token;
             best_val = row[p];
-            boost_next = (p == blank_id) ? boost_state : best_next;
+            boost_next = best_next;
         }
 
         const bool emit = (p != previous || previous == blank_id) && p != blank_id;

@@ -116,6 +116,56 @@ static float model_frame_sec(const pk::Model& model) {
     return (float)cfg.hop_length * (float)cfg.subsampling_factor / (float)cfg.sample_rate;
 }
 
+// Compile CLI boost phrases against a loaded pk::Model, warning about any the
+// vocabulary cannot represent. `tree` is the caller's storage; the returned
+// config borrows it, so `tree` must outlive every decode that uses the config.
+// Shared by the beam and greedy paths so both build the tree identically.
+static pk::BoostingConfig make_boost_config(
+        const pk::Model& model, const std::vector<std::string>& phrases,
+        float alpha, pk::BoostingTree& tree) {
+    pk::BoostingConfig boost;
+    if (phrases.empty()) return boost;
+
+    pk::BoostingSpec spec;
+    spec.phrases = phrases;
+    spec.alpha = alpha;
+    std::vector<std::string> rejected;
+    tree = model.build_boosting_tree(spec, &rejected);
+    for (const std::string& phrase : rejected)
+        std::fprintf(stderr,
+            "parakeet-cli: warning: cannot tokenize boost phrase '%s' "
+            "(skipped)\n", phrase.c_str());
+    boost.tree = &tree;
+    boost.alpha = alpha;
+    return boost;
+}
+
+// Attach CLI boost phrases to a C-API context. Returns false (after printing)
+// on a hard failure; a partial tokenization only warns.
+static bool apply_boost_to_ctx(parakeet_ctx* ctx,
+                               const std::vector<std::string>& phrases,
+                               float alpha) {
+    if (phrases.empty()) return true;
+    std::vector<const char*> raw;
+    raw.reserve(phrases.size());
+    for (const std::string& phrase : phrases) raw.push_back(phrase.c_str());
+
+    const int accepted = parakeet_capi_set_boost_phrases(
+        ctx, raw.data(), (int)raw.size(), alpha,
+        /*context_score=*/0.0f, /*depth_scaling=*/0.0f);
+    if (accepted < 0) {
+        std::fprintf(stderr, "parakeet-cli: failed to set boost phrases: %s\n",
+                     parakeet_capi_last_error(ctx));
+        return false;
+    }
+    if (accepted < (int)raw.size())
+        std::fprintf(stderr,
+            "parakeet-cli: warning: %d of %d boost phrases could not be "
+            "tokenized and were skipped\n",
+            (int)raw.size() - accepted, (int)raw.size());
+    return true;
+}
+
 // Print how each boost phrase was tokenized against the model's vocabulary.
 //
 // Worth checking whenever a phrase does not seem to boost. Phrase tokenization
@@ -314,6 +364,11 @@ static int cmd_transcribe(int argc, char** argv) {
             "parakeet-cli: --boost is not supported with --stream\n");
         return 2;
     }
+    if (!boost_phrases.empty() && decoder_str == "ctc") {
+        std::fprintf(stderr,
+            "parakeet-cli: --boost has no effect with --decoder ctc "
+            "(boosting is wired for the TDT greedy and beam decoders)\n");
+    }
     // Apply the thread override (offline + streaming graph compute). When unset
     // the persistent-backend default (kDefaultThreads) is used.
     if (threads > 0) pk::set_num_threads(threads);
@@ -399,23 +454,11 @@ static int cmd_transcribe(int argc, char** argv) {
                         "parakeet-cli: failed to load model %s\n", model.c_str());
                     return 1;
                 }
+                if (boost_debug && !boost_phrases.empty())
+                    print_boost_tokenization(*m, boost_phrases);
                 pk::BoostingTree boost_tree;
-                pk::BoostingConfig boost;
-                if (!boost_phrases.empty()) {
-                    if (boost_debug)
-                        print_boost_tokenization(*m, boost_phrases);
-                    pk::BoostingSpec spec;
-                    spec.phrases = boost_phrases;
-                    spec.alpha = boost_alpha;
-                    std::vector<std::string> rejected;
-                    boost_tree = m->build_boosting_tree(spec, &rejected);
-                    for (const std::string& phrase : rejected)
-                        std::fprintf(stderr,
-                            "parakeet-cli: warning: cannot tokenize boost "
-                            "phrase '%s' (skipped)\n", phrase.c_str());
-                    boost.tree = &boost_tree;
-                    boost.alpha = boost_alpha;
-                }
+                const pk::BoostingConfig boost = make_boost_config(
+                    *m, boost_phrases, boost_alpha, boost_tree);
                 std::vector<pk::NBestTranscription> hypotheses =
                     m->transcribe_pcm_nbest(
                         audio.samples, audio.sample_rate,
@@ -437,34 +480,16 @@ static int cmd_transcribe(int argc, char** argv) {
                 "parakeet-cli: failed to load model %s\n", model.c_str());
             return 1;
         }
-        if (!boost_phrases.empty()) {
-            if (boost_debug) {
-                // The C-API context does not expose the vocabulary, so load the
-                // model once more purely to report the tokenization. Diagnostic
-                // only — the transcription below still runs through the C-API.
-                if (std::unique_ptr<pk::Model> dbg = pk::Model::load(model))
-                    print_boost_tokenization(*dbg, boost_phrases);
-            }
-            std::vector<const char*> raw;
-            raw.reserve(boost_phrases.size());
-            for (const std::string& phrase : boost_phrases)
-                raw.push_back(phrase.c_str());
-            const int accepted = parakeet_capi_set_boost_phrases(
-                ctx, raw.data(), (int)raw.size(), boost_alpha,
-                /*context_score=*/0.0f, /*depth_scaling=*/0.0f);
-            if (accepted < 0) {
-                std::fprintf(stderr,
-                    "parakeet-cli: failed to set boost phrases: %s\n",
-                    parakeet_capi_last_error(ctx));
-                parakeet_capi_free(ctx);
-                return 1;
-            }
-            if (accepted < (int)raw.size()) {
-                std::fprintf(stderr,
-                    "parakeet-cli: warning: %d of %d boost phrases could not "
-                    "be tokenized and were skipped\n",
-                    (int)raw.size() - accepted, (int)raw.size());
-            }
+        if (boost_debug && !boost_phrases.empty()) {
+            // The C-API context does not expose the vocabulary, so load the
+            // model once more purely to report the tokenization. Diagnostic
+            // only — the transcription below still runs through the C-API.
+            if (std::unique_ptr<pk::Model> dbg = pk::Model::load(model))
+                print_boost_tokenization(*dbg, boost_phrases);
+        }
+        if (!apply_boost_to_ctx(ctx, boost_phrases, boost_alpha)) {
+            parakeet_capi_free(ctx);
+            return 1;
         }
         char* output = parakeet_capi_transcribe_path_nbest_json(
             ctx, input.c_str(), beam_size, nbest, score_norm ? 1 : 0,
@@ -496,8 +521,14 @@ static int cmd_transcribe(int argc, char** argv) {
                     std::fprintf(stderr, "parakeet-cli: failed to load model %s\n", model.c_str());
                     return 1;
                 }
+                if (boost_debug && !boost_phrases.empty())
+                    print_boost_tokenization(*m, boost_phrases);
+                pk::BoostingTree boost_tree;
+                const pk::BoostingConfig boost = make_boost_config(
+                    *m, boost_phrases, boost_alpha, boost_tree);
                 pk::Transcription tr =
-                    m->transcribe_with_timestamps(audio.samples, audio.sample_rate, dec, lang);
+                    m->transcribe_with_timestamps(audio.samples, audio.sample_rate,
+                                                  dec, lang, boost);
                 std::string j = pk::transcription_to_json(tr, model_frame_sec(*m));
                 std::printf("%s\n", j.c_str());
             } catch (const std::exception& e) {
@@ -510,6 +541,14 @@ static int cmd_transcribe(int argc, char** argv) {
         parakeet_ctx* ctx = parakeet_capi_load(model.c_str());
         if (!ctx) {
             std::fprintf(stderr, "parakeet-cli: failed to load model %s\n", model.c_str());
+            return 1;
+        }
+        if (boost_debug && !boost_phrases.empty()) {
+            if (std::unique_ptr<pk::Model> dbg = pk::Model::load(model))
+                print_boost_tokenization(*dbg, boost_phrases);
+        }
+        if (!apply_boost_to_ctx(ctx, boost_phrases, boost_alpha)) {
+            parakeet_capi_free(ctx);
             return 1;
         }
         char* j = parakeet_capi_transcribe_path_json(ctx, input.c_str(), dec_int);
@@ -538,11 +577,17 @@ static int cmd_transcribe(int argc, char** argv) {
                 std::fprintf(stderr, "parakeet-cli: failed to load model %s\n", model.c_str());
                 return 1;
             }
+            if (boost_debug && !boost_phrases.empty())
+                print_boost_tokenization(*m, boost_phrases);
+            pk::BoostingTree boost_tree;
+            const pk::BoostingConfig boost = make_boost_config(
+                *m, boost_phrases, boost_alpha, boost_tree);
             // `lang` (empty -> model default) selects the language prompt for
             // multilingual models; ignored by non-prompt models.
             pk::Transcription tr = is_stdin_input(input)
-                ? m->transcribe_with_timestamps(audio.samples, audio.sample_rate, dec, lang)
-                : m->transcribe_path_with_timestamps(input, dec, lang);
+                ? m->transcribe_with_timestamps(audio.samples, audio.sample_rate,
+                                                dec, lang, boost)
+                : m->transcribe_path_with_timestamps(input, dec, lang, boost);
             for (const pk::Word& w : tr.words)
                 std::printf("%.2f-%.2f  %s  (%.2f)\n", w.start, w.end,
                             w.text.c_str(), w.conf);
@@ -561,6 +606,14 @@ static int cmd_transcribe(int argc, char** argv) {
         parakeet_ctx* ctx = parakeet_capi_load(model.c_str());
         if (!ctx) {
             std::fprintf(stderr, "parakeet-cli: failed to load model %s\n", model.c_str());
+            return 1;
+        }
+        if (boost_debug && !boost_phrases.empty()) {
+            if (std::unique_ptr<pk::Model> dbg = pk::Model::load(model))
+                print_boost_tokenization(*dbg, boost_phrases);
+        }
+        if (!apply_boost_to_ctx(ctx, boost_phrases, boost_alpha)) {
+            parakeet_capi_free(ctx);
             return 1;
         }
         char* t = parakeet_capi_transcribe_path_lang(ctx, input.c_str(), dec_int,
@@ -589,9 +642,31 @@ static int cmd_transcribe(int argc, char** argv) {
                 std::fprintf(stderr, "parakeet-cli: failed to load model %s\n", model.c_str());
                 return 1;
             }
-            text = m->transcribe_pcm(audio.samples, audio.sample_rate, dec, lang);
-        } else {
+            if (boost_debug && !boost_phrases.empty())
+                print_boost_tokenization(*m, boost_phrases);
+            pk::BoostingTree boost_tree;
+            const pk::BoostingConfig boost = make_boost_config(
+                *m, boost_phrases, boost_alpha, boost_tree);
+            text = m->transcribe_pcm(audio.samples, audio.sample_rate, dec, lang,
+                                     boost);
+        } else if (boost_phrases.empty()) {
+            // Unboosted: keep the existing free-function path so behavior here
+            // is byte-for-byte unchanged.
             text = pk::transcribe(model, input, dec);
+        } else {
+            // pk::transcribe() reloads the model per call and takes no boosting
+            // config, so the boosted path goes through pk::Model directly.
+            std::unique_ptr<pk::Model> m = pk::Model::load(model);
+            if (!m) {
+                std::fprintf(stderr, "parakeet-cli: failed to load model %s\n",
+                             model.c_str());
+                return 1;
+            }
+            if (boost_debug) print_boost_tokenization(*m, boost_phrases);
+            pk::BoostingTree boost_tree;
+            const pk::BoostingConfig boost = make_boost_config(
+                *m, boost_phrases, boost_alpha, boost_tree);
+            text = m->transcribe_path(input, dec, lang, boost);
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "transcribe failed: %s\n", e.what());

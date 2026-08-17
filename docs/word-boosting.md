@@ -63,8 +63,14 @@ for `a` rather than all the way to the root.
 | Decoder | How | Notes |
 |---|---|---|
 | `tdt_beam_search` | Boost the whole token slice before `top_k` | Strongest path. Promoting a key token INTO the beam is the point — an acoustically weak first token can still be recovered once later tokens confirm the phrase. |
-| `tdt_greedy` | NeMo's two-stage greedy: argmax, rescore non-blanks, re-pick | Commits per frame, so a phrase whose first token scores very low is still missable. |
+| `tdt_greedy` | NeMo's two-stage greedy: argmax, rescore non-blanks, re-pick | Used by ordinary transcription (no `--beam-size`). Commits per frame, so a phrase whose first token scores very low is still missable. |
 | `ctc_greedy` | Same two-stage rescoring per frame | Tree state advances only on an EMITTED token, so CTC's repeat-collapse does not advance a phrase five times for one token held across five frames. |
+
+All three scan candidates in ascending token id and keep the incumbent on a
+tie (strict `>`), exactly like `decode_argmax` / `torch.max`. Blank is compared
+in its natural id position rather than seeded as the incumbent, so it loses ties
+to real tokens just as it would in a plain argmax — which is what makes
+`alpha == 0` bit-identical to an unboosted run rather than merely close.
 
 Two invariants hold across all three:
 
@@ -114,8 +120,19 @@ reuse it; the C-API does this for you.
 
 ## CLI
 
+Boosting applies to ordinary (greedy) transcription and to beam search alike.
+`--beam-size` selects the beam decoder; without it the TDT greedy decoder runs
+and is boosted just the same.
+
 ```sh
-# Inline phrases (repeatable), with beam search
+# Ordinary greedy transcription, boosted (no --beam-size)
+parakeet-cli transcribe \
+  --model parakeet-tdt_ctc-110m.gguf \
+  --input audio.wav \
+  --boost "kubernetes" --boost "parakeet" \
+  --boost-alpha 2.0
+
+# Beam search, boosted (stronger, slower)
 parakeet-cli transcribe \
   --model parakeet-tdt_ctc-110m.gguf \
   --input audio.wav \
@@ -209,5 +226,13 @@ auto hyps = model->transcribe_pcm_nbest(
 - **Streaming is not wired.** `pk::StreamingSession` does not take a
   `BoostingConfig` yet; `--boost` with `--stream` is rejected rather than
   silently ignored.
-- **Batched decoding is not wired** (`transcribe_pcm_batch*`).
+- **Batched decoding is not wired** (`transcribe_pcm_batch*` and their C-API
+  entry points decode unboosted).
+- **RNN-T greedy is not wired.** `rnnt_greedy` (used by TDT-less transducer
+  checkpoints) takes no `BoostingConfig`; only the TDT greedy/beam and CTC
+  decoders are boosted.
+- **`ctc_greedy` accepts a config but nothing routes one to it.** The CLI warns
+  that `--boost` has no effect with `--decoder ctc`, and `Model`'s CTC branch
+  passes no config, so a CTC checkpoint is never boosted in practice. The
+  decoder support exists for callers using `pk::ctc_greedy` directly.
 - Only one boost list per context, applied to every call on it.

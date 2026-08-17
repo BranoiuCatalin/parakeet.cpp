@@ -84,35 +84,13 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
             const int d_k = decode_argmax(logits.data() + token_count, num_dur);
             skip = durations[d_k];
 
-            // Context biasing, NeMo GPU-PB two-stage greedy: take the argmax
-            // above, then rescore the non-blank tokens through the boosting
-            // tree and re-select. Comparing boosted non-blanks against the
-            // UNBOOSTED blank keeps blank emission honest — biasing may only
-            // change which word is emitted, never whether one is.
-            //
-            // Greedy commits irreversibly at each step, so a phrase whose first
-            // token the acoustic model scores very low can still be missed here;
-            // beam search is the stronger biasing path.
+            // Context biasing (NeMo GPU-PB two-stage greedy). See
+            // detail::boosted_greedy_token.
             BoostingTree::State boost_next = boost_state;
-            if (boost.active()) {
-                float best_score = logits[(size_t)blank_id];
-                int best_token = blank_id;
-                BoostingTree::State best_next = BoostingTree::kRoot;
-                for (int token = 0; token < blank_id; ++token) {
-                    BoostingTree::State next = BoostingTree::kRoot;
-                    const float delta = boost.tree->advance(
-                        boost_state, (int32_t)token, &next);
-                    const float score =
-                        logits[(size_t)token] + boost.alpha * delta;
-                    if (score > best_score) {
-                        best_score = score;
-                        best_token = token;
-                        best_next = next;
-                    }
-                }
-                k = best_token;
-                boost_next = (best_token == blank_id) ? boost_state : best_next;
-            }
+            if (boost.active())
+                k = detail::boosted_greedy_token(logits.data(), blank_id,
+                                                 boost, boost_state,
+                                                 &boost_next);
 
             // Commit state + last_token ONLY when k != blank.
             if (k != blank_id) {
@@ -155,6 +133,54 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
 }
 
 namespace detail {
+
+int boosted_greedy_token(const float* token_logits, int blank_id,
+                         const BoostingConfig& boost,
+                         BoostingTree::State state,
+                         BoostingTree::State* next_state) {
+    // Second stage of NeMo's GPU-PB greedy: rescore every non-blank token
+    // through the boosting tree and re-select. Blank is scored UNBOOSTED, so
+    // biasing may change WHICH token is emitted but never whether one is.
+    //
+    // Scan in ascending id order and keep the incumbent on a tie (strict `>`),
+    // exactly like decode_argmax / torch.max. Blank is compared LAST, in its
+    // natural id position, so it loses ties to real tokens just as it would in
+    // a plain argmax. Seeding the scan with blank instead would let it win
+    // every tie and break the alpha == 0 equivalence.
+    if (blank_id <= 0) {          // degenerate head: blank is the only class
+        if (next_state) *next_state = state;
+        return blank_id;
+    }
+    BoostingTree::State best_next = BoostingTree::kRoot;
+    float best_score = token_logits[0] +
+                       boost.alpha * boost.tree->advance(state, 0, &best_next);
+    int best_token = 0;
+
+    for (int token = 1; token < blank_id; ++token) {
+        BoostingTree::State candidate = BoostingTree::kRoot;
+        const float delta =
+            boost.tree->advance(state, (int32_t)token, &candidate);
+        const float score =
+            token_logits[(size_t)token] + boost.alpha * delta;
+        if (score > best_score) {
+            best_score = score;
+            best_token = token;
+            best_next = candidate;
+        }
+    }
+
+    // Blank last, unboosted, strict `>` so it only wins outright.
+    if (token_logits[(size_t)blank_id] > best_score) {
+        best_token = blank_id;
+    }
+
+    // A blank win leaves the phrase position untouched: blank emits nothing, so
+    // it must not advance (or reset) a partial match. Same rule as the beam
+    // decoder, whose blank expansion copies boost_state unchanged.
+    if (next_state)
+        *next_state = (best_token == blank_id) ? state : best_next;
+    return best_token;
+}
 
 int best_positive_duration_index(
     const std::vector<float>& scores,

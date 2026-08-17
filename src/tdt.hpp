@@ -125,6 +125,23 @@ int best_positive_duration_index(
     const std::vector<float>& scores,
     const std::vector<int32_t>& durations);
 
+// One boosted greedy token selection: the second stage of NeMo's GPU-PB greedy
+// decoding. `token_logits` is the TOKEN slice only (length blank_id + 1, blank
+// last); duration logits are not passed because they are never boosted.
+//
+// Rescores every non-blank token as `logit + alpha * tree.advance(state, tok)`
+// and returns the winner, comparing against the UNBOOSTED blank score. Writes
+// the successor phrase state to *next_state: the advanced node on a non-blank
+// win, or `state` unchanged when blank wins (blank emits nothing, so it must
+// neither advance nor reset a partial match).
+//
+// Exposed here so greedy selection can be tested without loading a model.
+// Callers must ensure boost.active(); the caller in tdt_greedy checks first.
+int boosted_greedy_token(const float* token_logits, int blank_id,
+                         const BoostingConfig& boost,
+                         BoostingTree::State state,
+                         BoostingTree::State* next_state);
+
 } // namespace detail
 
 } // namespace pk

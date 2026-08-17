@@ -165,7 +165,8 @@ extern "C" char* parakeet_capi_transcribe_path_lang(parakeet_ctx* ctx,
     // NULL / "" -> model default language (ignored by non-prompt models).
     const std::string lang = target_lang ? target_lang : "";
     try {
-        std::string text = ctx->model->transcribe_path(wav_path, to_decoder(decoder), lang);
+        std::string text = ctx->model->transcribe_path(wav_path, to_decoder(decoder), lang,
+                                        ctx->boost);
         ctx->last_error.clear();
         char* out = dup_to_c(text);
         if (!out) { ctx->last_error = "out of memory"; return nullptr; }
@@ -196,7 +197,8 @@ extern "C" char* parakeet_capi_transcribe_pcm_lang(parakeet_ctx* ctx,
     const std::string lang = target_lang ? target_lang : "";
     try {
         std::vector<float> pcm(samples, samples + n_samples);
-        std::string text = ctx->model->transcribe_pcm(pcm, sample_rate, to_decoder(decoder), lang);
+        std::string text = ctx->model->transcribe_pcm(pcm, sample_rate, to_decoder(decoder),
+                                       lang, ctx->boost);
         ctx->last_error.clear();
         char* out = dup_to_c(text);
         if (!out) { ctx->last_error = "out of memory"; return nullptr; }
@@ -328,7 +330,8 @@ extern "C" char* parakeet_capi_transcribe_path_json(parakeet_ctx* ctx,
     if (!wav_path)   { ctx->last_error = "wav_path is NULL"; return nullptr; }
     try {
         pk::Transcription tr =
-            ctx->model->transcribe_path_with_timestamps(wav_path, to_decoder(decoder));
+            ctx->model->transcribe_path_with_timestamps(
+                wav_path, to_decoder(decoder), "", ctx->boost);
         // frame_sec = hop_length * subsampling_factor / sample_rate (token "t").
         const pk::ParakeetConfig& cfg = ctx->model->config();
         const float frame_sec =
